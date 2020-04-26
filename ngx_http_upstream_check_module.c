@@ -406,6 +406,15 @@ static void ngx_http_upstream_check_clear_all_events();
 
 static ngx_int_t ngx_http_upstream_check_status_handler(
     ngx_http_request_t *r);
+static void ngx_http_upstream_check_status_post_handler(
+    ngx_http_request_t *r);
+static ngx_int_t ngx_http_check_status_set_status(ngx_http_request_t *r, 
+    ngx_str_t *service_value, ngx_str_t *server_value,
+    ngx_str_t *action_value, ngx_str_t *type_value);
+static void ngx_url_decode(u_char* src, size_t src_len,
+    u_char* dest, size_t dest_len);
+static int ngx_http_get_post_args_param(ngx_str_t *args, 
+    const char* name, ngx_str_t *value);
 
 static void ngx_http_upstream_check_status_parse_args(ngx_http_request_t *r,
     ngx_http_upstream_check_status_ctx_t *ctx);
@@ -894,7 +903,7 @@ ngx_http_upstream_check_peer_down(ngx_uint_t index)
 
     peer = check_peers_ctx->peers.elts;
 
-    return (peer[index].shm->down);
+    return (peer[index].shm->down!=0);
 }
 
 
@@ -2517,7 +2526,7 @@ ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer,
     if (result) {
         peer->shm->rise_count++;
         peer->shm->fall_count = 0;
-        if (peer->shm->down && peer->shm->rise_count >= ucscf->rise_count) {
+        if (peer->shm->down==1 && peer->shm->rise_count >= ucscf->rise_count) {
             peer->shm->down = 0;
             ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                           "enable check peer: %V ",
@@ -2526,7 +2535,7 @@ ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer,
     } else {
         peer->shm->rise_count = 0;
         peer->shm->fall_count++;
-        if (!peer->shm->down && peer->shm->fall_count >= ucscf->fall_count) {
+        if (peer->shm->down==0 && peer->shm->fall_count >= ucscf->fall_count) {
             peer->shm->down = 1;
             ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                           "disable check peer: %V ",
@@ -2678,8 +2687,18 @@ ngx_http_upstream_check_status_handler(ngx_http_request_t *r)
     ngx_http_upstream_check_loc_conf_t    *uclcf;
     ngx_http_upstream_check_status_ctx_t  *ctx;
 
-    if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
+    if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD && r->method != NGX_HTTP_POST) {
         return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    if (r->method == NGX_HTTP_POST) {
+        rc = ngx_http_read_client_request_body(
+             r, ngx_http_upstream_check_status_post_handler);
+
+        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+            return rc;
+        }
+        return NGX_DONE;
     }
 
     rc = ngx_http_discard_request_body(r);
@@ -2752,6 +2771,324 @@ ngx_http_upstream_check_status_handler(ngx_http_request_t *r)
     }
 
     return ngx_http_output_filter(r, &out);
+}
+
+
+static void
+ngx_http_upstream_check_status_post_handler(ngx_http_request_t *r)
+{
+    size_t                            buffer_size;
+    ngx_chain_t                      *cl;
+    ngx_buf_t                        *buf;
+    size_t                            len;
+    ngx_str_t                         data;
+    ngx_str_t                         args;
+    ngx_str_t                         service_value;
+    ngx_str_t                         server_value;
+    ngx_str_t                         action_value;
+    ngx_str_t                         type_value;
+    u_char                            decode_service_value[256];
+    u_char                            decode_server_value[256];
+    ngx_int_t                         rc;
+    ngx_buf_t                        *b;
+    ngx_chain_t                       out;
+    ngx_http_upstream_check_peers_t  *peers;
+    ngx_http_upstream_check_status_ctx_t *ctx;
+    ngx_http_upstream_check_loc_conf_t   *cslcf;
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "ngx_http_upstream_check_status_post_handler start...");
+
+    if (!r || r->request_body == NULL || r->request_body->bufs == NULL) {
+        ngx_http_finalize_request(r, NGX_HTTP_NOT_ALLOWED);
+        return;
+    }
+
+    ngx_str_null(&data);
+    if(r->request_body->bufs->next)
+    {
+        for (cl = r->request_body->bufs; cl; cl = cl->next)
+        {
+            data.len += cl->buf->last - cl->buf->pos;
+        }
+
+        buf = ngx_create_temp_buf(r->pool, (size_t)(data.len+1));
+        if (buf == NULL) {
+            ngx_http_finalize_request(r, NGX_HTTP_NOT_ALLOWED);
+            return;
+        }
+    
+        for (cl = r->request_body->bufs; cl && cl->buf; cl = cl->next)
+        {
+            len = cl->buf->last - cl->buf->pos; 
+            ngx_memcpy(buf->last,cl->buf->pos,len);
+            buf->last += len;
+        }
+
+        data.data = buf->start;
+    }
+    else
+    {
+        data.data = r->request_body->bufs->buf->pos;
+        data.len = r->request_body->bufs->buf->last - r->request_body->bufs->buf->pos;
+    }
+
+    ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                    "bufs has no next");
+    ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                    "data=\"%V\"", &data);
+
+    if(data.len>0)
+    {
+        args.data = data.data;
+        args.len = data.len;
+
+        ngx_str_null(&service_value);
+        ngx_str_null(&server_value);
+        ngx_str_null(&action_value);
+        ngx_str_null(&type_value);
+        
+        ngx_http_get_post_args_param(&args,"service=",&service_value);
+        ngx_http_get_post_args_param(&args,"server=",&server_value);
+        ngx_http_get_post_args_param(&args,"action=",&action_value);
+        ngx_http_get_post_args_param(&args,"type=",&type_value);
+
+        ngx_url_decode(service_value.data, service_value.len, decode_service_value, 
+                       sizeof(decode_service_value));
+        ngx_url_decode(server_value.data, server_value.len, decode_server_value, 
+                       sizeof(decode_server_value));
+
+        service_value.data = decode_service_value;
+        service_value.len = ngx_strlen(decode_service_value);
+        server_value.data = decode_server_value;
+        server_value.len = ngx_strlen(decode_server_value);
+
+        rc = ngx_http_check_status_set_status(r, &service_value, &server_value, 
+                                         &action_value, &type_value);
+        if (rc == NGX_ERROR) {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        cslcf = ngx_http_get_module_loc_conf(r, ngx_http_upstream_check_module);
+
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_check_status_ctx_t));
+        if (ctx == NULL) {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        if (ctx->format == NULL) {
+            ctx->format = cslcf->format;
+        }
+
+        r->headers_out.content_type_len = ctx->format->content_type.len;
+        r->headers_out.content_type = ctx->format->content_type;
+        r->headers_out.content_type_lowcase = NULL;
+
+        peers = check_peers_ctx;
+        if (peers == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "http upstream check module can not find any check "
+                        "server, make sure you've added the check servers");
+
+            rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        buffer_size = peers->peers.nelts * ngx_pagesize / 4;
+        buffer_size = ngx_align(buffer_size, ngx_pagesize) + ngx_pagesize;
+
+        b = ngx_create_temp_buf(r->pool, buffer_size);
+        if (b == NULL) {
+            rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        out.buf = b;
+        out.next = NULL;
+
+        ctx->format->output(b, peers, ctx->flag);
+
+        if (rc != NGX_OK) {
+            ngx_http_finalize_request(r, rc);
+            return;
+        }
+
+        rc = ngx_http_send_header(r);
+
+        if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+            ngx_http_finalize_request(r, rc);
+            return;
+        }
+
+        rc = ngx_http_output_filter(r, &out);
+
+    } else {
+        rc = NGX_HTTP_NOT_ALLOWED;
+    }
+
+    ngx_http_finalize_request(r, rc);
+
+    return;
+}
+
+
+static int 
+ngx_http_get_post_args_param(ngx_str_t *args, const char* name, ngx_str_t *value)
+{
+    int len,i,start,end;
+
+    if(!args || !args->data || !name)
+        return NGX_ERROR;
+
+    i = 0;
+    start = -1;
+    end = -1;
+    len = strlen(name);
+    
+    while(i<(int)args->len)
+    {
+        if(start<0 && i<(int)args->len-len && args->data[i]==name[0] && !memcmp(&args->data[i],name,len))
+        {
+            start = i+len;
+            i+=len;
+        }
+        else
+        {
+            if(start>=0 && args->data[i]=='&')
+            {
+                end = i;
+                break;
+            }
+            
+            i++;
+        }
+    }
+    
+    if(start>=0)
+    {
+        if(end>0)
+        {
+            value->data = &args->data[start];
+            value->len = end - start;
+        }
+        else
+        {
+            value->data = &args->data[start];
+            value->len = args->len - start;
+        }
+        
+        return NGX_OK;
+    }
+    else
+    {
+        value->data = NULL;
+        value->len = 0;
+    }
+    
+    return NGX_ERROR;
+}
+
+
+static ngx_int_t 
+ngx_http_check_status_set_status(ngx_http_request_t *r, 
+    ngx_str_t *service_value, ngx_str_t *server_value, 
+    ngx_str_t *action_value, ngx_str_t *type_value)
+{
+    ngx_http_upstream_check_peers_t    *peers = NULL;
+    ngx_http_upstream_check_peer_t     *peer = NULL;
+    ngx_uint_t                          action = NGX_CONF_UNSET_UINT;
+    ngx_uint_t                          i;
+
+    if (service_value == NULL || server_value == NULL || type_value == NULL 
+            || action_value == NULL)
+        return NGX_ERROR;
+    
+    if (!service_value->data || !server_value->data || !type_value->data 
+            || !action_value->data)
+        return NGX_ERROR;
+    
+    if (action_value->len == 5 
+            && ngx_strncmp((char *)action_value->data, "pause", 5) == 0) {
+        action = 2;
+    } else if (action_value->len == 6 
+            && ngx_strncmp((char *)action_value->data, "reopen", 6) == 0) {
+        action = 0;
+    }
+
+    if (action == NGX_CONF_UNSET_UINT) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "invalid action, \"%V\"", action_value);
+        return NGX_ERROR;
+    }
+
+    if (type_value->len == 4 
+            && ngx_strncmp((char *)type_value->data, "http", 4) == 0) {
+
+        peers = check_peers_ctx;
+        peer = peers->peers.elts;
+        for (i = 0; i < peers->peers.nelts; i++) {
+            if (peer[i].upstream_name->len == service_value->len
+                && peer[i].peer_addr->name.len == server_value->len
+                && strncmp((char *)peer[i].upstream_name->data, (char *)service_value->data, 
+                        service_value->len) == 0
+                && strncmp((char *)peer[i].peer_addr->name.data, (char *)server_value->data, 
+                        server_value->len) == 0)
+            {
+                if(action == 0) {
+                    if(peer[i].shm->rise_count>0)
+                        peer[i].shm->down = 0;
+                    else
+                        peer[i].shm->down = 1;
+                } else {
+                    peer[i].shm->down = 2;
+                }
+            }
+        }
+        return NGX_OK;
+    } else {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "invalid type, \"%V\"", type_value);
+        return NGX_ERROR;
+    }
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                  "match peer failed service=%V server=%V", 
+                  service_value, server_value);
+
+    return NGX_ERROR;
+}
+
+
+static void
+ngx_url_decode(u_char* src, size_t src_len, u_char* dest, size_t dest_len)
+{
+    size_t i;
+    size_t j;
+    u_char *cd = src;
+    u_char p[2];
+
+    if(!src || !dest || src_len <= 0 || dest_len <= 0)
+        return;
+
+    for(j = 0, i = 0; i < src_len && j < dest_len - 1; i++)
+    {
+        memset(p, '\0', 2);
+        if( cd[i] != '%' )
+        {
+            dest[j++] = cd[i];
+            continue;
+        }
+  
+          p[0] = cd[++i];
+        p[1] = cd[++i];
+
+        p[0] = p[0] - 48 - ((p[0] >= 'A') ? 7 : 0) - ((p[0] >= 'a') ? 32 : 0); 
+        p[1] = p[1] - 48 - ((p[1] >= 'A') ? 7 : 0) - ((p[1] >= 'a') ? 32 : 0); 
+        
+        dest[j++] = (u_char)(p[0] * 16 + p[1]); 
+    }
+    
+    dest[j] = '\0';
 }
 
 
@@ -2833,6 +3170,9 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
 {
     ngx_uint_t                      i, count;
     ngx_http_upstream_check_peer_t *peer;
+    char *status = NULL;
+    char *bgcolor = NULL;
+    char *action = NULL;
 
     peer = peers->peers.elts;
 
@@ -2895,6 +3235,25 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
             }
         }
 
+        if(peer[i].shm->down==1)
+        {
+            status = "down";
+            action = "pause";
+            bgcolor = " bgcolor=\"#FF0000\"";
+        }
+        else if(peer[i].shm->down==2)
+        {
+            status = "pause";
+            action = "reopen";
+            bgcolor = " bgcolor=\"#FFFF00\"";
+        }
+        else
+        {
+            status = "up";
+            action = "pause";
+            bgcolor = "";
+        }
+
         b->last = ngx_snprintf(b->last, b->end - b->last,
                 "  <tr%s>\n"
                 "    <td>%ui</td>\n"
@@ -2905,16 +3264,28 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
                 "    <td>%ui</td>\n"
                 "    <td>%V</td>\n"
                 "    <td>%ui</td>\n"
+                "    <td align=\"center\"><form name=\"input\" action=\"\" method=\"post\">\n"
+                "    <input type=\"hidden\" name=\"service\" value=\"%V\">\n"
+                "    <input type=\"hidden\" name=\"server\" value=\"%V\">\n"
+                "    <input type=\"hidden\" name=\"action\" value=\"%s\">\n"
+                "    <input type=\"hidden\" name=\"type\" value=\"http\">\n"
+                "    <input type=\"hidden\" name=\"format\" value=\"html\">\n"
+                "    <input type=\"submit\" value=\"%s\">\n"
+                "    </form></td>\n"
                 "  </tr>\n",
-                peer[i].shm->down ? " bgcolor=\"#FF0000\"" : "",
+                bgcolor,
                 i,
                 peer[i].upstream_name,
                 &peer[i].peer_addr->name,
-                peer[i].shm->down ? "down" : "up",
+                status,
                 peer[i].shm->rise_count,
                 peer[i].shm->fall_count,
                 &peer[i].conf->check_type_conf->name,
-                peer[i].conf->port);
+                peer[i].conf->port,
+                peer[i].upstream_name,
+                &peer[i].peer_addr->name,
+                action,
+                action);
     }
 
     b->last = ngx_snprintf(b->last, b->end - b->last,
